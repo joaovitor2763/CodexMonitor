@@ -29,7 +29,15 @@ struct UsageTotals {
     output: i64,
 }
 
+#[derive(Clone)]
+enum UsageRoot {
+    DayPartitioned(PathBuf),
+    Flat(PathBuf),
+}
+
 const MAX_ACTIVITY_GAP_MS: i64 = 2 * 60 * 1000;
+const MAX_JSONL_SCAN_DEPTH: usize = 4;
+const MAX_JSONL_FILES: usize = 2000;
 
 #[tauri::command]
 pub(crate) async fn local_usage_snapshot(
@@ -61,7 +69,7 @@ pub(crate) async fn local_usage_snapshot(
 fn scan_local_usage(
     days: u32,
     workspace_path: Option<&Path>,
-    sessions_roots: &[PathBuf],
+    sessions_roots: &[UsageRoot],
 ) -> Result<LocalUsageSnapshot, String> {
     let updated_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -80,21 +88,32 @@ fn scan_local_usage(
     }
 
     for root in sessions_roots {
-        for day_key in &day_keys {
-            let day_dir = day_dir_for_key(root, day_key);
-            if !day_dir.exists() {
-                continue;
-            }
-            let entries = match std::fs::read_dir(&day_dir) {
-                Ok(entries) => entries,
-                Err(_) => continue,
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
-                    continue;
+        match root {
+            UsageRoot::DayPartitioned(root) => {
+                for day_key in &day_keys {
+                    let day_dir = day_dir_for_key(root, day_key);
+                    if !day_dir.exists() {
+                        continue;
+                    }
+                    let entries = match std::fs::read_dir(&day_dir) {
+                        Ok(entries) => entries,
+                        Err(_) => continue,
+                    };
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+                            continue;
+                        }
+                        scan_file(&path, &mut daily, &mut model_totals, workspace_path)?;
+                    }
                 }
-                scan_file(&path, &mut daily, &mut model_totals, workspace_path)?;
+            }
+            UsageRoot::Flat(root) => {
+                let mut jsonl_files = Vec::new();
+                collect_jsonl_files(root, 0, &mut jsonl_files);
+                for path in jsonl_files {
+                    scan_file(&path, &mut daily, &mut model_totals, workspace_path)?;
+                }
             }
         }
     }
@@ -214,12 +233,9 @@ fn scan_file(
             Ok(value) => value,
             Err(_) => continue,
         };
-        let entry_type = value
-            .get("type")
-            .and_then(|value| value.as_str())
-            .unwrap_or("");
+        let entry_type = value.get("type").and_then(|value| value.as_str()).unwrap_or("");
 
-        if entry_type == "session_meta" || entry_type == "turn_context" {
+        if !match_known {
             if let Some(cwd) = extract_cwd(&value) {
                 if let Some(filter) = workspace_path {
                     matches_workspace = path_matches_workspace(&cwd, filter);
@@ -253,156 +269,42 @@ fn scan_file(
             continue;
         }
 
-        if entry_type == "event_msg" || entry_type.is_empty() {
-            let payload = value.get("payload").and_then(|value| value.as_object());
-            let payload_type = payload
-                .and_then(|payload| payload.get("type"))
-                .and_then(|value| value.as_str());
-
-            if payload_type == Some("agent_message") {
-                if let Some(timestamp_ms) = read_timestamp_ms(&value) {
-                    if seen_runs.insert(timestamp_ms) {
-                        if let Some(day_key) = day_key_for_timestamp_ms(timestamp_ms) {
-                            if let Some(entry) = daily.get_mut(&day_key) {
-                                entry.agent_runs += 1;
-                            }
+        if let Some(timestamp_ms) = read_timestamp_ms(&value) {
+            if is_agent_message(&value) {
+                if seen_runs.insert(timestamp_ms) {
+                    if let Some(day_key) = day_key_for_timestamp_ms(timestamp_ms) {
+                        if let Some(entry) = daily.get_mut(&day_key) {
+                            entry.agent_runs += 1;
                         }
                     }
-                    track_activity(daily, &mut last_activity_ms, timestamp_ms);
                 }
-                continue;
-            }
-
-            if payload_type == Some("agent_reasoning") {
-                if let Some(timestamp_ms) = read_timestamp_ms(&value) {
-                    track_activity(daily, &mut last_activity_ms, timestamp_ms);
-                }
-                continue;
-            }
-
-            if payload_type != Some("token_count") {
-                continue;
-            }
-
-            let info = payload.and_then(|payload| payload.get("info")).and_then(|v| v.as_object());
-            let (input, cached, output, used_total) = if let Some(info) = info {
-                if let Some(total) =
-                    find_usage_map(info, &["total_token_usage", "totalTokenUsage"])
-                {
-                    (
-                        read_i64(total, &["input_tokens", "inputTokens"]),
-                        read_i64(
-                            total,
-                            &[
-                                "cached_input_tokens",
-                                "cache_read_input_tokens",
-                                "cachedInputTokens",
-                                "cacheReadInputTokens",
-                            ],
-                        ),
-                        read_i64(total, &["output_tokens", "outputTokens"]),
-                        true,
-                    )
-                } else if let Some(last) =
-                    find_usage_map(info, &["last_token_usage", "lastTokenUsage"])
-                {
-                    (
-                        read_i64(last, &["input_tokens", "inputTokens"]),
-                        read_i64(
-                            last,
-                            &[
-                                "cached_input_tokens",
-                                "cache_read_input_tokens",
-                                "cachedInputTokens",
-                                "cacheReadInputTokens",
-                            ],
-                        ),
-                        read_i64(last, &["output_tokens", "outputTokens"]),
-                        false,
-                    )
-                } else {
-                    continue;
-                }
-            } else {
-                continue;
-            };
-
-            let mut delta = UsageTotals {
-                input,
-                cached,
-                output,
-            };
-
-            if used_total {
-                let prev = previous_totals.unwrap_or_default();
-                delta = UsageTotals {
-                    input: (input - prev.input).max(0),
-                    cached: (cached - prev.cached).max(0),
-                    output: (output - prev.output).max(0),
-                };
-                previous_totals = Some(UsageTotals { input, cached, output });
-            } else {
-                // Some streams emit `last_token_usage` deltas between `total_token_usage` snapshots.
-                // Treat those as already-counted to avoid double-counting when the next total arrives.
-                let mut next = previous_totals.unwrap_or_default();
-                next.input += delta.input;
-                next.cached += delta.cached;
-                next.output += delta.output;
-                previous_totals = Some(next);
-            }
-
-            if delta.input == 0 && delta.cached == 0 && delta.output == 0 {
-                continue;
-            }
-
-            let timestamp_ms = read_timestamp_ms(&value);
-            if let Some(day_key) = timestamp_ms.and_then(|ms| day_key_for_timestamp_ms(ms)) {
-                if let Some(entry) = daily.get_mut(&day_key) {
-                    let cached = delta.cached.min(delta.input);
-                    entry.input += delta.input;
-                    entry.cached += cached;
-                    entry.output += delta.output;
-
-                    let model = current_model
-                        .clone()
-                        .or_else(|| extract_model_from_token_count(&value))
-                        .unwrap_or_else(|| "unknown".to_string());
-                    *model_totals.entry(model).or_insert(0) += delta.input + delta.output;
-                }
-            }
-
-            if let Some(timestamp_ms) = timestamp_ms {
+                track_activity(daily, &mut last_activity_ms, timestamp_ms);
+            } else if is_agent_reasoning(&value) {
                 track_activity(daily, &mut last_activity_ms, timestamp_ms);
             }
+        }
+
+        if let Some(delta) = extract_usage_from_event_msg(&value, &mut previous_totals) {
+            apply_usage_delta(
+                &value,
+                delta,
+                &mut daily,
+                &mut model_totals,
+                &current_model,
+                &mut last_activity_ms,
+            );
             continue;
         }
 
-        if entry_type == "response_item" {
-            let payload = value.get("payload").and_then(|value| value.as_object());
-            let payload_type = payload
-                .and_then(|payload| payload.get("type"))
-                .and_then(|value| value.as_str());
-            let role = payload
-                .and_then(|payload| payload.get("role"))
-                .and_then(|value| value.as_str())
-                .unwrap_or("");
-
-            if role == "assistant" {
-                if let Some(timestamp_ms) = read_timestamp_ms(&value) {
-                    if seen_runs.insert(timestamp_ms) {
-                        if let Some(day_key) = day_key_for_timestamp_ms(timestamp_ms) {
-                            if let Some(entry) = daily.get_mut(&day_key) {
-                                entry.agent_runs += 1;
-                            }
-                        }
-                    }
-                    track_activity(daily, &mut last_activity_ms, timestamp_ms);
-                }
-            } else if payload_type != Some("message") {
-                if let Some(timestamp_ms) = read_timestamp_ms(&value) {
-                    track_activity(daily, &mut last_activity_ms, timestamp_ms);
-                }
-            }
+        if let Some(delta) = extract_usage_from_generic(&value) {
+            apply_usage_delta(
+                &value,
+                delta,
+                &mut daily,
+                &mut model_totals,
+                &current_model,
+                &mut last_activity_ms,
+            );
         }
     }
 
@@ -434,6 +336,32 @@ fn extract_model_from_token_count(value: &Value) -> Option<String> {
     model.map(|value| value.to_string())
 }
 
+fn extract_model_from_entry(value: &Value) -> Option<String> {
+    extract_model_from_token_count(value)
+        .or_else(|| {
+            value
+                .get("payload")
+                .and_then(|payload| payload.get("model"))
+                .and_then(|model| model.as_str())
+                .map(|model| model.to_string())
+        })
+        .or_else(|| {
+            value
+                .get("payload")
+                .and_then(|payload| payload.get("message"))
+                .and_then(|message| message.get("model"))
+                .and_then(|model| model.as_str())
+                .map(|model| model.to_string())
+        })
+        .or_else(|| {
+            value
+                .get("message")
+                .and_then(|message| message.get("model"))
+                .and_then(|model| model.as_str())
+                .map(|model| model.to_string())
+        })
+}
+
 fn find_usage_map<'a>(
     info: &'a serde_json::Map<String, Value>,
     keys: &[&str],
@@ -447,6 +375,43 @@ fn read_i64(map: &serde_json::Map<String, Value>, keys: &[&str]) -> i64 {
         .find_map(|key| map.get(*key))
         .and_then(|value| value.as_i64().or_else(|| value.as_f64().map(|value| value as i64)))
         .unwrap_or(0)
+}
+
+fn read_usage_totals(map: &serde_json::Map<String, Value>) -> UsageTotals {
+    let input = read_i64(
+        map,
+        &[
+            "input_tokens",
+            "inputTokens",
+            "prompt_tokens",
+            "promptTokens",
+        ],
+    );
+    let output = read_i64(
+        map,
+        &[
+            "output_tokens",
+            "outputTokens",
+            "completion_tokens",
+            "completionTokens",
+        ],
+    );
+    let cached = read_i64(
+        map,
+        &[
+            "cached_input_tokens",
+            "cache_read_input_tokens",
+            "cacheReadInputTokens",
+            "cachedInputTokens",
+            "cache_creation_input_tokens",
+            "cacheCreationInputTokens",
+        ],
+    );
+    UsageTotals {
+        input,
+        cached,
+        output,
+    }
 }
 
 fn read_timestamp_ms(value: &Value) -> Option<i64> {
@@ -463,6 +428,159 @@ fn read_timestamp_ms(value: &Value) -> Option<i64> {
         return Some(numeric * 1000);
     }
     Some(numeric)
+}
+
+fn is_agent_message(value: &Value) -> bool {
+    let entry_type = value.get("type").and_then(|value| value.as_str()).unwrap_or("");
+    if entry_type == "agent_message" || entry_type == "assistant_message" {
+        return true;
+    }
+    if entry_type == "event_msg" || entry_type.is_empty() {
+        let payload = value.get("payload").and_then(|value| value.as_object());
+        let payload_type = payload
+            .and_then(|payload| payload.get("type"))
+            .and_then(|value| value.as_str());
+        if payload_type == Some("agent_message") {
+            return true;
+        }
+    }
+    let role = value
+        .get("role")
+        .and_then(|value| value.as_str())
+        .or_else(|| {
+            value
+                .get("payload")
+                .and_then(|payload| payload.get("role"))
+                .and_then(|value| value.as_str())
+        })
+        .or_else(|| {
+            value
+                .get("payload")
+                .and_then(|payload| payload.get("message"))
+                .and_then(|message| message.get("role"))
+                .and_then(|value| value.as_str())
+        })
+        .or_else(|| {
+            value
+                .get("payload")
+                .and_then(|payload| payload.get("response"))
+                .and_then(|response| response.get("role"))
+                .and_then(|value| value.as_str())
+        });
+    role == Some("assistant")
+}
+
+fn is_agent_reasoning(value: &Value) -> bool {
+    let entry_type = value.get("type").and_then(|value| value.as_str()).unwrap_or("");
+    if entry_type == "agent_reasoning" {
+        return true;
+    }
+    if entry_type == "event_msg" || entry_type.is_empty() {
+        let payload = value.get("payload").and_then(|value| value.as_object());
+        let payload_type = payload
+            .and_then(|payload| payload.get("type"))
+            .and_then(|value| value.as_str());
+        return payload_type == Some("agent_reasoning");
+    }
+    false
+}
+
+fn extract_usage_from_event_msg(
+    value: &Value,
+    previous_totals: &mut Option<UsageTotals>,
+) -> Option<UsageTotals> {
+    let entry_type = value.get("type").and_then(|value| value.as_str()).unwrap_or("");
+    if entry_type != "event_msg" && !entry_type.is_empty() {
+        return None;
+    }
+    let payload = value.get("payload").and_then(|value| value.as_object())?;
+    let payload_type = payload.get("type").and_then(|value| value.as_str());
+    if payload_type != Some("token_count") {
+        return None;
+    }
+    let info = payload.get("info").and_then(|v| v.as_object())?;
+    let (totals, used_total) = if let Some(total) =
+        find_usage_map(info, &["total_token_usage", "totalTokenUsage"])
+    {
+        (read_usage_totals(total), true)
+    } else if let Some(last) = find_usage_map(info, &["last_token_usage", "lastTokenUsage"]) {
+        (read_usage_totals(last), false)
+    } else {
+        return None;
+    };
+
+    let mut delta = totals;
+    if used_total {
+        let prev = previous_totals.unwrap_or_default();
+        delta = UsageTotals {
+            input: (totals.input - prev.input).max(0),
+            cached: (totals.cached - prev.cached).max(0),
+            output: (totals.output - prev.output).max(0),
+        };
+        *previous_totals = Some(totals);
+    } else {
+        // Some streams emit `last_token_usage` deltas between `total_token_usage` snapshots.
+        // Treat those as already-counted to avoid double-counting when the next total arrives.
+        let mut next = previous_totals.unwrap_or_default();
+        next.input += delta.input;
+        next.cached += delta.cached;
+        next.output += delta.output;
+        *previous_totals = Some(next);
+    }
+
+    if delta.input == 0 && delta.cached == 0 && delta.output == 0 {
+        None
+    } else {
+        Some(delta)
+    }
+}
+
+fn extract_usage_from_generic(value: &Value) -> Option<UsageTotals> {
+    let candidates = [
+        value.get("usage"),
+        value.get("payload").and_then(|payload| payload.get("usage")),
+        value.get("payload").and_then(|payload| payload.get("message")).and_then(|message| message.get("usage")),
+        value.get("payload").and_then(|payload| payload.get("response")).and_then(|response| response.get("usage")),
+        value.get("message").and_then(|message| message.get("usage")),
+        value.get("response").and_then(|response| response.get("usage")),
+    ];
+    for candidate in candidates.iter().flatten() {
+        if let Some(map) = candidate.as_object() {
+            let totals = read_usage_totals(map);
+            if totals.input != 0 || totals.cached != 0 || totals.output != 0 {
+                return Some(totals);
+            }
+        }
+    }
+    None
+}
+
+fn apply_usage_delta(
+    value: &Value,
+    delta: UsageTotals,
+    daily: &mut HashMap<String, DailyTotals>,
+    model_totals: &mut HashMap<String, i64>,
+    current_model: &Option<String>,
+    last_activity_ms: &mut Option<i64>,
+) {
+    let timestamp_ms = read_timestamp_ms(value);
+    if let Some(day_key) = timestamp_ms.and_then(|ms| day_key_for_timestamp_ms(ms)) {
+        if let Some(entry) = daily.get_mut(&day_key) {
+            let cached = delta.cached.min(delta.input);
+            entry.input += delta.input;
+            entry.cached += cached;
+            entry.output += delta.output;
+
+            let model = current_model
+                .clone()
+                .or_else(|| extract_model_from_entry(value))
+                .unwrap_or_else(|| "unknown".to_string());
+            *model_totals.entry(model).or_insert(0) += delta.input + delta.output;
+        }
+    }
+    if let Some(timestamp_ms) = timestamp_ms {
+        track_activity(daily, last_activity_ms, timestamp_ms);
+    }
 }
 
 fn track_activity(
@@ -493,6 +611,20 @@ fn extract_cwd(value: &Value) -> Option<String> {
         .get("payload")
         .and_then(|payload| payload.get("cwd"))
         .and_then(|cwd| cwd.as_str())
+        .or_else(|| value.get("cwd").and_then(|cwd| cwd.as_str()))
+        .or_else(|| {
+            value
+                .get("payload")
+                .and_then(|payload| payload.get("meta"))
+                .and_then(|meta| meta.get("cwd"))
+                .and_then(|cwd| cwd.as_str())
+        })
+        .or_else(|| {
+            value
+                .get("meta")
+                .and_then(|meta| meta.get("cwd"))
+                .and_then(|cwd| cwd.as_str())
+        })
         .map(|cwd| cwd.to_string())
 }
 
@@ -518,14 +650,82 @@ fn resolve_codex_sessions_root(codex_home_override: Option<PathBuf>) -> Option<P
         .map(|home| home.join("sessions"))
 }
 
+fn resolve_claude_homes() -> Vec<PathBuf> {
+    let mut homes = Vec::new();
+    let mut seen = HashSet::new();
+
+    for key in ["CLAUDE_HOME", "CLAUDE_CODE_HOME"] {
+        if let Ok(value) = std::env::var(key) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                let path = PathBuf::from(trimmed);
+                if seen.insert(path.clone()) {
+                    homes.push(path);
+                }
+            }
+        }
+    }
+
+    if let Ok(value) = std::env::var("XDG_DATA_HOME") {
+        let path = PathBuf::from(value).join("claude");
+        if seen.insert(path.clone()) {
+            homes.push(path);
+        }
+    }
+
+    if let Ok(value) = std::env::var("XDG_CONFIG_HOME") {
+        let path = PathBuf::from(value).join("claude");
+        if seen.insert(path.clone()) {
+            homes.push(path);
+        }
+    }
+
+    if let Ok(home) = std::env::var("HOME") {
+        let paths = [
+            PathBuf::from(&home).join(".claude"),
+            PathBuf::from(&home).join(".config/claude"),
+            PathBuf::from(&home).join(".local/share/claude"),
+        ];
+        for path in paths {
+            if seen.insert(path.clone()) {
+                homes.push(path);
+            }
+        }
+    }
+
+    homes
+}
+
+fn resolve_claude_sessions_roots() -> Vec<UsageRoot> {
+    let mut roots = Vec::new();
+    let mut seen = HashSet::new();
+    for home in resolve_claude_homes() {
+        let candidates = [home.join("sessions"), home.join("logs"), home];
+        for path in candidates {
+            if !path.exists() {
+                continue;
+            }
+            if seen.insert(path.clone()) {
+                roots.push(UsageRoot::Flat(path));
+            }
+        }
+    }
+    roots
+}
+
 fn resolve_sessions_roots(
     workspaces: &HashMap<String, WorkspaceEntry>,
     workspace_path: Option<&Path>,
-) -> Vec<PathBuf> {
+) -> Vec<UsageRoot> {
     if let Some(workspace_path) = workspace_path {
         let codex_home_override =
             resolve_workspace_codex_home_for_path(workspaces, Some(workspace_path));
-        return resolve_codex_sessions_root(codex_home_override).into_iter().collect();
+        let mut roots = Vec::new();
+        if let Some(root) = resolve_codex_sessions_root(codex_home_override) {
+            roots.push(UsageRoot::DayPartitioned(root));
+        }
+        roots.extend(resolve_claude_sessions_roots());
+        return roots;
     }
 
     let mut roots = Vec::new();
@@ -533,7 +733,7 @@ fn resolve_sessions_roots(
 
     if let Some(root) = resolve_codex_sessions_root(None) {
         if seen.insert(root.clone()) {
-            roots.push(root);
+            roots.push(UsageRoot::DayPartitioned(root));
         }
     }
 
@@ -547,10 +747,12 @@ fn resolve_sessions_roots(
         };
         if let Some(root) = resolve_codex_sessions_root(Some(codex_home)) {
             if seen.insert(root.clone()) {
-                roots.push(root);
+                roots.push(UsageRoot::DayPartitioned(root));
             }
         }
     }
+
+    roots.extend(resolve_claude_sessions_roots());
 
     roots
 }
@@ -582,6 +784,29 @@ fn day_dir_for_key(root: &Path, day_key: &str) -> PathBuf {
     let month = parts.next().unwrap_or("01");
     let day = parts.next().unwrap_or("01");
     root.join(year).join(month).join(day)
+}
+
+fn collect_jsonl_files(root: &Path, depth: usize, files: &mut Vec<PathBuf>) {
+    if depth > MAX_JSONL_SCAN_DEPTH || files.len() >= MAX_JSONL_FILES {
+        return;
+    }
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        if files.len() >= MAX_JSONL_FILES {
+            break;
+        }
+        let path = entry.path();
+        if path.is_dir() {
+            collect_jsonl_files(&path, depth + 1, files);
+            continue;
+        }
+        if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
+            files.push(path);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -791,7 +1016,15 @@ mod tests {
         write_session_file(&root_a, &day_key, &[line_a]);
         write_session_file(&root_b, &day_key, &[line_b]);
 
-        let snapshot = scan_local_usage(2, None, &[root_a, root_b]).expect("scan usage");
+        let snapshot = scan_local_usage(
+            2,
+            None,
+            &[
+                UsageRoot::DayPartitioned(root_a),
+                UsageRoot::DayPartitioned(root_b),
+            ],
+        )
+        .expect("scan usage");
         let day = snapshot
             .days
             .iter()
@@ -847,7 +1080,33 @@ mod tests {
         let expected_a = PathBuf::from(entry_a.settings.codex_home.unwrap()).join("sessions");
         let expected_b = PathBuf::from(entry_b.settings.codex_home.unwrap()).join("sessions");
 
-        assert!(roots.iter().any(|root| root == &expected_a));
-        assert!(roots.iter().any(|root| root == &expected_b));
+        let root_paths = roots
+            .iter()
+            .filter_map(|root| match root {
+                UsageRoot::DayPartitioned(path) | UsageRoot::Flat(path) => Some(path),
+            })
+            .collect::<Vec<_>>();
+
+        assert!(root_paths.iter().any(|root| *root == &expected_a));
+        assert!(root_paths.iter().any(|root| *root == &expected_b));
+    }
+
+    #[test]
+    fn scan_file_reads_usage_from_generic_payload() {
+        let day_key = "2026-01-19";
+        let path = write_temp_jsonl(&[
+            r#"{"timestamp":"2026-01-19T12:00:00.000Z","type":"message","usage":{"input_tokens":12,"output_tokens":4,"cache_read_input_tokens":2},"model":"claude-3"}"#,
+        ]);
+
+        let mut daily: HashMap<String, DailyTotals> = HashMap::new();
+        daily.insert(day_key.to_string(), DailyTotals::default());
+        let mut model_totals: HashMap<String, i64> = HashMap::new();
+        scan_file(&path, &mut daily, &mut model_totals, None).expect("scan file");
+
+        let totals = daily.get(day_key).copied().unwrap_or_default();
+        assert_eq!(totals.input, 12);
+        assert_eq!(totals.cached, 2);
+        assert_eq!(totals.output, 4);
+        assert_eq!(model_totals.get("claude-3"), Some(&16));
     }
 }

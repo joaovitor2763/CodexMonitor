@@ -129,6 +129,7 @@ src-tauri/
 - Threads are restored by filtering `thread/list` results using the workspace `cwd`.
 - Selecting a thread always calls `thread/resume` to refresh messages from disk.
 - CLI sessions appear if their `cwd` matches the workspace path; they are not live-streamed unless resumed.
+- Local usage metrics include Codex sessions and Claude Code CLI logs when available (typically under `~/.claude` or XDG data/config paths).
 - The app uses `codex app-server` over stdio; see `src-tauri/src/lib.rs`.
 - Codex sessions use the default Codex home (usually `~/.codex`); if a legacy `.codexmonitor/` exists in a workspace, it is used for that workspace.
 - Worktree agents live under the app data directory (`worktrees/<workspace-id>`); legacy `.codex-worktrees/` paths remain supported, and the app no longer edits repo `.gitignore` files.
